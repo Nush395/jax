@@ -47,15 +47,19 @@ from .. import linear_util as lu
 from .. import lazy
 from ..abstract_arrays import (ConcreteArray, ShapedArray, array_types,
                                raise_to_shaped)
-from ..util import (partial, unzip2, prod, safe_map, safe_zip,
+from ..util import (partial, unzip2, unzip3, prod, safe_map, safe_zip,
                     extend_name_stack, wrap_name)
 from ..lib import xla_bridge as xb
-from ..tree_util import tree_map
+from ..lib import xla_client as xc
+from ..tree_util import tree_flatten, tree_map
 from .batching import broadcast, not_mapped
 from . import batching
 from . import partial_eval as pe
 from . import xla
 from . import ad
+
+
+xops = xc.ops
 
 FLAGS = flags.FLAGS
 
@@ -137,10 +141,10 @@ def spec_to_indices(shape: Tuple[int, ...],
 
   # `product` will always return a sequence of tuples. Skip the tuples if each
   # index is a single element.
-  if len(indices_per_axis) > 1:
-    indices = list(product(*indices_per_axis))
-  else:
+  if len(indices_per_axis) == 1:
     indices = list(indices_per_axis[0])
+  else:
+    indices = list(product(*indices_per_axis))
 
   return tuple(i for i in indices
                for _ in range(sharding_spec.replication_factor))
@@ -192,6 +196,7 @@ def shard_args(devices: Sequence[xb.xla_client.Device],
         buffers[r][a] = (buf if buf.device() == devices[r]
                          else buf.copy_to_device(devices[r]))
     else:
+      arg = xla.canonicalize_dtype(arg)
       bufs = shard_arg_handlers[type(arg)](arg, devices, indices[a])
       for r, buf in enumerate(bufs):
         buffers[r][a] = buf
@@ -206,7 +211,42 @@ def _shard_array(x, devices, indices):
   return [xla.device_put(x[i], d) for (i, d) in zip(indices, devices)]
 for _t in array_types:
   shard_arg_handlers[_t] = _shard_array
-shard_arg_handlers[xla.DeviceArray] = _shard_array
+
+def _shard_device_array(x, devices, indices):
+  start_indices, limit_indices, removed_dims = map(tuple, unzip3(
+      _as_slice_indices(x, idx) for idx in indices))
+  shards = x._multi_slice(start_indices, limit_indices, removed_dims)
+  return [xla.device_put(s, d) for s, d in zip(shards, devices)]
+shard_arg_handlers[xla.DeviceArray] = _shard_device_array
+
+# NOTE(skye): we could refactor to generate _multi_slice parameters directly
+# from the input ShardingSpec, rather than the indices. However, this would
+# require duplicating the ordering logic of spec_to_indices, which is more
+# subtle and more likely to change than the index logic we have to support here.
+def _as_slice_indices(arr: xla.DeviceArray, idx: Index) -> Tuple[
+    Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+  """Returns start_indices, limit_indices, removed_dims"""
+  start_indices = [0] * arr.ndim
+  limit_indices = list(arr.shape)
+  removed_dims = []
+
+  tuple_idx = idx if isinstance(idx, tuple) else (idx,)
+  for dim, sub_idx in enumerate(tuple_idx):
+    if isinstance(sub_idx, int):
+      start_indices[dim] = sub_idx
+      limit_indices[dim] = sub_idx + 1
+      removed_dims.append(dim)
+    elif sub_idx == slice(None):
+      continue
+    else:
+      assert isinstance(sub_idx, slice)
+      assert isinstance(sub_idx.start, int)
+      assert isinstance(sub_idx.stop, int)
+      start_indices[dim] = sub_idx.start
+      limit_indices[dim] = sub_idx.stop
+
+  return tuple(start_indices), tuple(limit_indices), tuple(removed_dims) # type: ignore
+
 
 def shard_aval(size, aval):
   try:
@@ -226,14 +266,13 @@ def _shard_abstract_array(size, x):
 shard_aval_handlers[ShapedArray] = _shard_abstract_array
 
 # TODO(skye): expose PyLocalBuffers in xla_client
-def aval_to_result_handler(size: int, sharding_spec: Optional[ShardingSpec],
+def aval_to_result_handler(sharding_spec: Optional[ShardingSpec],
                            indices: Optional[Tuple[Index]],
                            aval: core.AbstractValue) -> Callable[
                                [List[xb.xla_client._xla.PyLocalBuffer]], Any]:
   """Returns a function for handling the raw buffers of a single output aval.
 
   Args:
-    size: the pmap axis size
     sharding_spec: indicates how the output is sharded across devices, or None
       for non-array avals.
     indices: the pre-computed result of spec_to_indices, or None for non-array
@@ -243,10 +282,10 @@ def aval_to_result_handler(size: int, sharding_spec: Optional[ShardingSpec],
   Returns:
     A function for handling the PyLocalBuffers that will eventually be produced
     for this output. The function will return an object suitable for returning
-    from pmap, e.g. a ShardedDeviceArray.
+    to the user, e.g. a ShardedDeviceArray.
   """
   try:
-    return pxla_result_handlers[type(aval)](size, sharding_spec, indices, aval)
+    return pxla_result_handlers[type(aval)](sharding_spec, indices, aval)
   except KeyError as err:
     raise TypeError("No pxla_result_handler for type: {}".format(type(aval))
                     ) from err
@@ -254,10 +293,8 @@ PxlaResultHandler = Callable[..., Callable[
     [List[xb.xla_client._xla.PyLocalBuffer]], Any]]
 pxla_result_handlers: Dict[Type[core.AbstractValue], PxlaResultHandler] = {}
 pxla_result_handlers[core.AbstractUnit] = lambda *_: lambda _: core.unit
-def array_result_handler(size, sharding_spec, indices, aval: ShapedArray):
-  full_aval = ShapedArray((size,) + aval.shape, aval.dtype)
-  return lambda bufs: ShardedDeviceArray(full_aval, sharding_spec, bufs,
-                                         indices)
+def array_result_handler(sharding_spec, indices, aval: ShapedArray):
+  return lambda bufs: ShardedDeviceArray(aval, sharding_spec, bufs, indices)
 pxla_result_handlers[ShapedArray] = array_result_handler
 pxla_result_handlers[ConcreteArray] = array_result_handler
 
@@ -335,11 +372,15 @@ def apply_parallel_primitive(prim, *args, **params):
   # look up information in the dynamic axis env.
   dynamic_axis_env = _thread_local_state.dynamic_axis_env
   axis_name = params.pop('axis_name')
-  logical_size = lambda frame: frame.hard_size * (frame.soft_size or 1)
-  if isinstance(axis_name, (list, tuple)):
-    shape = tuple(logical_size(dynamic_axis_env[name]) for name in axis_name)
+  axis_index_groups = params.pop('axis_index_groups')
+  if axis_index_groups is not None:
+    shape = (len(axis_index_groups[0]),)
   else:
-    shape = (logical_size(dynamic_axis_env[axis_name]),)
+    logical_size = lambda frame: frame.hard_size * (frame.soft_size or 1)
+    if isinstance(axis_name, (list, tuple)):
+      shape = tuple(logical_size(dynamic_axis_env[name]) for name in axis_name)
+    else:
+      shape = (logical_size(dynamic_axis_env[axis_name]),)
   return parallel_pure_rules[prim](*args, shape=shape, **params)
 
 parallel_pure_rules: Dict[core.Primitive, Callable] = {}
@@ -383,36 +424,39 @@ def axis_index(axis_name):
    [0 1]
    [0 1]]
   """
+  return axis_index_p.bind(axis_name=axis_name)
+
+def _axis_index_bind(*, axis_name):
   dynamic_axis_env = _thread_local_state.dynamic_axis_env
   frame = dynamic_axis_env[axis_name]
   sizes = dynamic_axis_env.sizes[:dynamic_axis_env.index(frame)+1]
   nreps = dynamic_axis_env.nreps
-  dummy_arg = frame.pmap_trace.pure(core.unit)
-  if frame.soft_trace:
-    dummy_arg = frame.soft_trace.pure(dummy_arg)
+  trace = frame.pmap_trace
 
-  return axis_index_p.bind(dummy_arg, nreps=nreps, sizes=sizes,
-                           soft_size=frame.soft_size, axis_name=axis_name)
-
-def _axis_index_partial_eval(trace, _, **params):
-  # This partial_eval rule adds the axis_index primitive into the jaxpr formed
-  # during pmap lowering. It is like the standard JaxprTrace.process_primitive
-  # rule except that we don't attempt to lower out of the trace.
   out_aval = ShapedArray((), onp.int32)
   out_tracer = pe.JaxprTracer(trace, pe.PartialVal.unknown(out_aval), None)
-  eqn = pe.new_eqn_recipe([], [out_tracer], axis_index_p, params)
+  eqn = pe.new_eqn_recipe([], [out_tracer], axis_index_p,
+                          dict(nreps=nreps, sizes=sizes,
+                               soft_size=frame.soft_size, axis_name=axis_name))
   out_tracer.recipe = eqn
-  return out_tracer
+
+  if not frame.soft_trace:
+    return out_tracer
+  else:
+    val_out = out_tracer * frame.soft_size + onp.arange(frame.soft_size)
+    return SplitAxisTracer(frame.soft_trace, axis_name, val_out)
 
 def _axis_index_translation_rule(c, nreps, sizes, soft_size, axis_name):
-  div = c.Constant(onp.array(nreps // prod(sizes), dtype=onp.uint32))
-  mod = c.Constant(onp.array(sizes[-1], dtype=onp.uint32))
-  unsigned_index = c.Rem(c.Div(c.ReplicaId(), div), mod)
-  return c.ConvertElementType(unsigned_index, xb.dtype_to_etype(onp.int32))
+  div = xb.constant(c, onp.array(nreps // prod(sizes), dtype=onp.uint32))
+  mod = xb.constant(c, onp.array(sizes[-1], dtype=onp.uint32))
+  unsigned_index = xops.Rem(xops.Div(xops.ReplicaId(c), div), mod)
+  return xops.ConvertElementType(unsigned_index, xb.dtype_to_etype(onp.int32))
 
 axis_index_p = core.Primitive('axis_index')
+axis_index_p.def_custom_bind(_axis_index_bind)
+axis_index_p.def_abstract_eval(
+    lambda *args, **params: ShapedArray((), onp.int32))
 xla.translations[axis_index_p] = _axis_index_translation_rule
-pe.custom_partial_eval_rules[axis_index_p] = _axis_index_partial_eval
 
 
 ### lazy device-memory persistence and result handling
@@ -454,10 +498,10 @@ class ShardedDeviceArray(xla.DeviceArray):
     # providing sharding_spec. It assumes that any pre-existing callers are
     # creating pmap-style ShardedDeviceArrays.
     if device_buffers is None:
-      assert isinstance(sharding_spec[0], xb.xla_client._xla.PyLocalBuffer)
       device_buffers = sharding_spec
+      sharded_aval = ShapedArray(aval.shape[1:], aval.dtype)
       sharding_spec = _pmap_sharding_spec(aval.shape[0], aval.shape[0],
-                                          aval.shape[1:])
+                                          1, None, sharded_aval, True)
 
     # TODO(skye): assert invariants. Keep performance in mind though.
     if indices is None:
@@ -496,10 +540,11 @@ class ShardedDeviceArray(xla.DeviceArray):
   def _value(self):
     if self._npy_value is None:
       self.copy_to_host_async()
-      self._npy_value = onp.empty(self.aval.shape, self.aval.dtype)
+      npy_value = onp.empty(self.aval.shape, self.aval.dtype)
       for i in range(0, len(self.device_buffers),
                      self.sharding_spec.replication_factor):
-        self._npy_value[self.indices[i]] = self.device_buffers[i].to_py()
+        npy_value[self.indices[i]] = self.device_buffers[i].to_py()
+      self._npy_value = npy_value
     return self._npy_value
 
   def __getitem__(self, idx):
@@ -542,7 +587,7 @@ def _shard_sharded_device_array_slow_path(x, devices, indices):
 shard_arg_handlers[ShardedDeviceArray] = _shard_sharded_device_array_slow_path
 
 def _sharded_device_array_constant_handler(c, val, canonicalize_types=True):
-  return c.Constant(onp.asarray(val), canonicalize_types=canonicalize_types)
+  return xb.constant(c, onp.asarray(val), canonicalize_types=canonicalize_types)
 xb.register_constant_handler(ShardedDeviceArray, _sharded_device_array_constant_handler)
 
 core.pytype_aval_mappings[ShardedDeviceArray] = ConcreteArray
@@ -554,35 +599,32 @@ xla.canonicalize_dtype_handlers[ShardedDeviceArray] = identity
 ### the xla_pmap primitive and its rules are comparable to xla_call in xla.py
 
 def xla_pmap_impl(fun: lu.WrappedFun, *args, backend, axis_name, axis_size, global_axis_size,
-                  devices, name, mapped_invars=None):
+                  devices, name, mapped_invars):
   abstract_args = map(xla.abstractify, args)
   compiled_fun = parallel_callable(fun, backend, axis_name, axis_size,
-                                   global_axis_size, devices, name, *abstract_args)
+                                   global_axis_size, devices, name, mapped_invars,
+                                   *abstract_args)
   return compiled_fun(*args)
 
 @lu.cache
 def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
-                      devices, name, *avals):
+                      devices, name, mapped_invars, *avals):
   if devices is not None and len(devices) == 0:
     raise ValueError("'devices' argument to pmap must be non-empty, or None.")
 
+  inner_pmap = len(_thread_local_state.dynamic_axis_env) > 0
+
   # Determine global_axis_size for use in AxisEnv.
+  must_run_on_all_devices = True
   if devices:
     assert global_axis_size is None  # Checked in api.py
     global_axis_size = len(devices)
+    must_run_on_all_devices = False
   elif xb.host_count() > 1:
     if global_axis_size is None:
-      # TODO(skye): relax this constraint or provide functionality for
-      # automatically passing appropriate `devices`.
-      # TODO(trevorcai): This check forces us to provide global_axis_size for
-      # all pmaps on pmap-on-pod. Can we do it after tracing?
-      if axis_size != xb.local_device_count():
-        raise ValueError(
-            "On multi-host platforms, the input to pmapped functions must have "
-            "leading axis size equal to the number of local devices if no "
-            "`devices` argument is specified. Got axis_size=%d, "
-            "num_local_devices=%d" % (axis_size, xb.local_device_count()))
-      global_axis_size = xb.device_count()
+      if inner_pmap:
+        raise ValueError("'axis_size' must be specified for nested multi-host pmaps")
+      global_axis_size = axis_size * xb.host_count()
   else:
     if global_axis_size is not None:
       if global_axis_size != axis_size:
@@ -591,11 +633,6 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
                 global_axis_size, axis_size))
     else:
       global_axis_size = axis_size
-
-  log_priority = logging.WARNING if FLAGS.jax_log_compiles else logging.DEBUG
-  logging.log(log_priority,
-              "Compiling {} for {} devices with args {}.".format(
-                  fun.__name__, global_axis_size, avals))
 
   if devices:
     local_devices = [d for d in devices if d.host_id == xb.host_id()]
@@ -608,13 +645,15 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
     with extend_dynamic_axis_env(axis_name, dummy._trace, global_axis_size):
       return fun.call_wrapped(*args)
 
-  sharded_avals = tuple(map(partial(shard_aval, axis_size), avals))
+  sharded_avals = tuple(shard_aval(axis_size, aval) if m else aval
+                        for m, aval in zip(mapped_invars, avals))
   pvals = [pe.PartialVal.unknown(aval) for aval in sharded_avals]
-  # We add a dummy first invar, to carry the trace details to `dynamic_fun`
+  # We add a dummy first invar, to carry the trace  details to `dynamic_fun`
   pval = pe.PartialVal.unknown(core.abstract_unit)  # dummy value for axis env
   jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
       dynamic_fun, [pval] + pvals, instantiate=False, stage_out=True, bottom=True)
   jaxpr.invars = jaxpr.invars[1:]  # ignore dummy
+  jaxpr, uses_outfeed = xla.apply_outfeed_rewriter(jaxpr)
 
   out_pvs, out_consts = unzip2(out_pvals)
 
@@ -635,31 +674,67 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
     # XLA computation at all; we handle this as a special case so we can stage
     # out multi-replica XLA computations regardless of the hardware available.
     # The 'None' values here are just dummies we know will be ignored.
-    handlers = [_pval_to_result_handler(axis_size, None, pval, local_devices,
-                                        backend)
-                for pval in out_pvals]
+    handlers = [
+        _pval_to_result_handler(axis_size, None, None, None, pval, local_devices,
+                                backend) for pval in out_pvals
+    ]
     results = [handler(None) for handler in handlers]
     return lambda *_: results
 
   jaxpr_replicas = xla.jaxpr_replicas(jaxpr)
   num_local_replicas = axis_size * jaxpr_replicas
   num_global_replicas = global_axis_size * jaxpr_replicas
+  arg_parts, out_parts, num_partitions = _find_partitions(jaxpr)
+
+  num_local_shards = num_local_replicas * num_partitions
+  num_global_shards = num_global_replicas * num_partitions
+
+  if (xb.host_count() > 1 and not inner_pmap and
+      must_run_on_all_devices and num_local_shards != xb.local_device_count()):
+    if num_local_shards == axis_size:
+      raise ValueError(
+         f"On multi-host platforms, the input to pmapped functions must have "
+         f"leading axis size equal to the number of local devices if no "
+         f"`devices` argument is specified. Got axis_size={axis_size}, "
+         f"num_local_devices={xb.local_device_count()}")
+    else:
+      raise ValueError(
+        f"On multi-host platforms, pmapped functions must run across all "
+        f"devices, i.e. num_replicas * num_partitions should equal the "
+        f"number of local devices. Got num_replicas={num_local_replicas}, "
+        f"num_partitions={num_partitions}, and "
+        f"num_local_devices={xb.local_device_count()}")
+
+  log_priority = logging.WARNING if FLAGS.jax_log_compiles else logging.DEBUG
+  logging.log(log_priority,
+              f"Compiling {fun.__name__} for {num_global_shards} devices with "
+              f"args {avals}. (num_replicas={num_global_replicas} "
+              f"num_partitions={num_partitions}")
+
   axis_env = xla.AxisEnv(num_global_replicas, (axis_name,), (global_axis_size,), devices)
 
   tuple_args = len(sharded_avals) > 100  # pass long arg lists as tuple for TPU
 
   c = xb.make_computation_builder("pmap_{}".format(fun.__name__))
-  xla_consts = _map(c.Constant, consts)
-  xla_args = xla._xla_callable_args(c, sharded_avals, tuple_args)
+  xla_consts = _map(partial(xb.constant, c), consts)
+  replicated = [not m for m in mapped_invars]
+  xla_args = xla._xla_callable_args(c, sharded_avals, tuple_args, replicated,
+                                    arg_parts)
   out_nodes = xla.jaxpr_subcomp(c, jaxpr, backend, axis_env, xla_consts,
                                 extend_name_stack(wrap_name(name, 'pmap')), *xla_args)
-  built = c.Build(c.Tuple(*out_nodes))
+  build_out_tuple = partial(xops.Tuple, c, out_nodes)
+  if out_parts is not None:
+    out_tuple = xb.with_sharding(c, out_parts, build_out_tuple)
+  else:
+    out_tuple = build_out_tuple()
+  built = c.Build(out_tuple)
 
   if devices is None:
-    if num_global_replicas > xb.device_count(backend):
-      msg = ("compiling computation that requires {} replicas, but only {} XLA "
-             "devices are available")
-      raise ValueError(msg.format(num_global_replicas, xb.device_count(backend)))
+    if num_global_shards > xb.device_count(backend):
+      msg = ("compiling computation that requires {} logical devices, but only {} XLA "
+             "devices are available (num_replicas={}, num_partitions={})")
+      raise ValueError(msg.format(num_global_shards, xb.device_count(backend),
+                                  num_global_replicas, num_partitions))
 
     # On a single host, we use the platform's default device assignment to
     # potentially take advantage of device locality. On multiple hosts, the
@@ -674,55 +749,152 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
                  for d in xb.local_devices(host_id)]
     else:
       devices = xb.get_backend(backend).get_default_device_assignment(
-          num_global_replicas)
+          num_global_replicas, num_partitions)
   else:
-    if num_local_replicas != len(local_devices):
+    if num_local_shards != len(local_devices):
       local_devices_str = ", ".join(map(str, local_devices))
       raise ValueError(
           "Leading axis size of input to pmapped function must equal the "
           "number of local devices passed to pmap. Got axis_size=%d, "
           "num_local_devices=%d.\n(Local devices passed to pmap: %s)"
           % (axis_size, len(local_devices), local_devices_str))
-    if num_global_replicas != len(devices):
-      raise ValueError("compiling computation that requires %s replicas, "
-                       "but %s devices were specified"
-                       % (num_global_replicas, len(devices)))
+    if num_global_shards != len(devices):
+      raise ValueError("compiling computation that creates %s shards, "
+                       "but %s devices were specified" %
+                       (num_global_shards, len(devices)))
 
-  device_assignment = tuple(d.id for d in devices)
+  # 'devices' may be 1D or 2D at this point (e.g.
+  # get_default_device_assignment() returns 2D assignment, caller may have
+  # provided 1D list of devices).
+  device_assignment = tree_map(lambda d: d.id, devices)
+  # Convert to 2D in case it's 1D and we have > 1 partitions.
+  device_assignment = onp.array(device_assignment).reshape(
+      (num_global_replicas, num_partitions))
   compile_options = xb.get_compile_options(
           num_replicas=num_global_replicas,
-          num_partitions=1,
+          num_partitions=num_partitions,
           device_assignment=device_assignment)
-  compile_options.tuple_arguments = tuple_args
-  compiled = built.Compile(compile_options=compile_options,
-                           backend=xb.get_backend(backend))
+  compile_options.parameter_is_tupled_arguments = tuple_args
+  backend = xb.get_backend(backend)
+  compiled = backend.compile(built, compile_options=compile_options)
 
-  input_sharding_specs = [_pmap_sharding_spec(num_local_replicas, axis_size,
-                                              aval.shape)
-                          if aval is not core.abstract_unit else None
-                          for aval in sharded_avals]
+  input_sharding_specs = [
+      _pmap_sharding_spec(
+          num_local_replicas, axis_size, num_partitions, parts, aval, mapped)
+      for (aval, parts, mapped)
+      in safe_zip(sharded_avals, arg_parts or [None] * len(avals),
+                  mapped_invars)]
   input_indices = [spec_to_indices(aval.shape, spec)
                    if spec is not None else None
                    for aval, spec in zip(avals, input_sharding_specs)]
   handle_args = partial(shard_args, compiled.local_devices(), input_indices)
 
   handle_outs = _pvals_to_results_handler(axis_size, num_local_replicas,
+                                          num_partitions, out_parts,
                                           out_pvals, compiled.local_devices(),
                                           backend)
-  return partial(execute_replicated, compiled, backend, handle_args,
+  return partial(execute_replicated, compiled, uses_outfeed, backend, handle_args,
                  handle_outs)
 
 multi_host_supported_collectives: Set[core.Primitive] = set()
 
+
+PartitionsOrReplicated = Optional[Tuple[int, ...]]
+
+def _find_partitions(jaxpr) -> Tuple[
+    Optional[Tuple[PartitionsOrReplicated, ...]],
+    Optional[Tuple[PartitionsOrReplicated, ...]],
+    int]:
+  """Returns (in_partitions, out_partitions, num_partitions)."""
+  for eqn in jaxpr.eqns:
+    if eqn.primitive.name == "sharded_call":
+      if len(jaxpr.eqns) > 1:
+        raise NotImplementedError(
+            "pmap of sharded_jit + non-sharded operations not yet implemented.")
+      num_partitions = reconcile_num_partitions(eqn.params["call_jaxpr"],
+                                                eqn.params["num_partitions"])
+      return (eqn.params["in_parts"], eqn.params["out_parts_thunk"](),
+              num_partitions)
+  return None, None, 1
+
+
+def reconcile_num_partitions(jaxpr, outer_num_parts: Optional[int]):
+  """Returns the total number of partitions to use.
+
+  Validates that any inner partitioning matches outer_num_parts if provided, and
+  returns the number of partitions to use based on outer_num_parts and any inner
+  partitioning.
+  """
+  inner_num_parts = _inner_partitions(jaxpr, outer_num_parts)
+  if outer_num_parts is None and inner_num_parts is None:
+    # No partitions specified anywhere, everything is replicated.
+    return 1
+  if outer_num_parts is None:
+    return inner_num_parts
+  return outer_num_parts
+
+
+
+def _inner_partitions(jaxpr, expected_num_parts: Optional[int]):
+  """Returns the total number of partitions from PartitionSpecs inside `jaxpr`.
+
+  Also validates that this number matches `expected_num_parts` if provided.
+  """
+  for eqn in jaxpr.eqns:
+    if eqn.primitive.name == "sharding_constraint":
+      parts = eqn.params["partitions"]
+      nparts = get_num_partitions(parts)
+      if expected_num_parts is None:
+        expected_num_parts = nparts
+      elif nparts != expected_num_parts:
+        # TODO(skye): raise this error as we trace the jaxpr
+        raise ValueError(
+            f"with_sharding_constraint with partitions={parts} "
+            f"(total partitions: {nparts}) doesn't match expected number of "
+            f"partitions: {expected_num_parts}. If these partitions look "
+            f"right, check outer sharded_jit and/or other "
+            f"with_sharding_constraint calls.")
+      elif eqn.primitive.call_primitive:
+        expected_num_parts = _inner_partitions(eqn.params["call_jaxpr"],
+                                               expected_num_parts)
+      # TODO(skye): control flow
+  return expected_num_parts
+
+
+def get_num_partitions(*partitions):
+  partition_specs = tree_flatten(partitions)[0]
+  if len(partition_specs) == 0:
+    # Everything is specified as replicated (all Nones).
+    return None
+  num_partitions_set = set(onp.prod(spec) for spec in partition_specs)
+  if len(num_partitions_set) > 1:
+    raise ValueError(
+        f"All partition specs must use the same number of total partitions, "
+        f"got {partitions}, with distinct number of partitions "
+        f"{num_partitions_set} (the total number of partitions is the product "
+        f"of a partition spec)")
+  assert len(num_partitions_set) == 1
+  return num_partitions_set.pop()
+
+
 class ResultToPopulate(object): pass
 result_to_populate = ResultToPopulate()
 
-def _pvals_to_results_handler(size, nrep, out_pvals, devices, backend):
+def _pvals_to_results_handler(
+    size, nrep, npart,
+    out_parts: Optional[Tuple[PartitionsOrReplicated, ...]],
+    out_pvals, devices, backend):
   nouts = len(out_pvals)
-  handlers = [_pval_to_result_handler(size, nrep, pval, devices, backend)
-              for pval in out_pvals]
+  if out_parts is None:
+    out_parts = (None,) * len(out_pvals)
+  handlers = [
+      _pval_to_result_handler(size, nrep, npart, parts, pval, devices, backend)
+      for pval, parts in safe_zip(out_pvals, out_parts)
+  ]
+
   def handler(out_bufs):
-    buffers = [[result_to_populate] * nrep for _ in range(nouts)]
+    assert nrep * npart == len(out_bufs)
+    buffers = [[result_to_populate] * nrep * npart for _ in range(nouts)]
     for r, tuple_buf in enumerate(out_bufs):
       for i, buf in enumerate(tuple_buf):
         buffers[i][r] = buf
@@ -766,11 +938,13 @@ def replicate(val, axis_size, nrep, devices=None, backend=None):
   # TODO(jekbradbury): use ShardingSpec.replication_factor instead
   aval = xla.abstractify(val)  # type: ShapedArray
   replicated_aval = ShapedArray((axis_size,) + aval.shape, aval.dtype)
-  sharding_spec = _pmap_sharding_spec(nrep, axis_size, aval.shape)
+  # TODO(skye): figure out how partitioning should work here
+  sharding_spec = _pmap_sharding_spec(nrep, axis_size, 1, None, aval, True)
   device_buffers = [xla.device_put(val, d) for d in devices]
   return ShardedDeviceArray(replicated_aval, sharding_spec, device_buffers)
 
-def _pval_to_result_handler(axis_size, nrep, pval, devices, backend):
+
+def _pval_to_result_handler(axis_size, nrep, npart, parts, pval, devices, backend):
   if devices:
     assert all(d.host_id == xb.host_id(backend) for d in devices)
   pv, const = pval
@@ -792,29 +966,69 @@ def _pval_to_result_handler(axis_size, nrep, pval, devices, backend):
     return lambda _: bcast_const
   else:
     if pv is not core.abstract_unit:
-      sharding_spec = _pmap_sharding_spec(nrep, axis_size, pv.shape)
-      indices = spec_to_indices((axis_size,) + pv.shape, sharding_spec)
+      unsharded_aval = ShapedArray((axis_size,) + pv.shape, pv.dtype)
+      sharding_spec = _pmap_sharding_spec(nrep, axis_size, npart, parts, pv,
+                                          True)
+      indices = spec_to_indices(unsharded_aval.shape, sharding_spec)
     else:
       sharding_spec = indices = None
-    return aval_to_result_handler(axis_size, sharding_spec, indices, pv)
+      unsharded_aval = pv
+    return aval_to_result_handler(sharding_spec, indices, unsharded_aval)
 
-def _pmap_sharding_spec(nrep, axis_size, sharded_shape):
+def _pmap_sharding_spec(nrep, axis_size, npart, parts, sharded_aval, mapped):
+  if not mapped and npart > 1:
+    # TODO(skye, jekbradbury): ShardingSpec assumes replication is treated as
+    # the innermost axis, but in this case, it needs to be the outer axis.
+    raise NotImplementedError(
+        "Using pmap(in_axes=None) over sharded_jit not yet implemented.")
+
+  if sharded_aval is core.abstract_unit:
+    return None
+
   replication_factor, ragged = divmod(nrep, axis_size)
   assert not ragged
-  return ShardingSpec(
-      shards_per_axis=(axis_size,) + (1,) * len(sharded_shape),
-      is_axis_materialized=(False,) + (True,) * len(sharded_shape),
-      replication_factor=replication_factor)
+  shard_spec = partitioned_sharding_spec(npart, parts, sharded_aval)
+  assert shard_spec is not None  # hint for pytype
+  if mapped:
+    return ShardingSpec(
+        shards_per_axis=(axis_size,) + shard_spec.shards_per_axis,
+        is_axis_materialized=(False,) + shard_spec.shards_per_axis,
+        replication_factor=replication_factor * shard_spec.replication_factor)
+  else:
+    return ShardingSpec(
+        shards_per_axis=shard_spec.shards_per_axis,
+        is_axis_materialized=shard_spec.is_axis_materialized,
+        replication_factor=replication_factor * axis_size)
 
 
-def execute_replicated(compiled, backend, in_handler, out_handler, *args):
+def partitioned_sharding_spec(num_partitions: int,
+                              partitions: Optional[Sequence[int]], aval):
+  if aval is core.abstract_unit:
+    return None
+
+  if partitions is None:
+    return ShardingSpec(
+        shards_per_axis=(1,) * len(aval.shape),
+        is_axis_materialized=(True,) * len(aval.shape),
+        replication_factor=num_partitions)
+  else:
+    assert len(partitions) == len(aval.shape)
+    return ShardingSpec(
+        shards_per_axis=tuple(partitions),
+        is_axis_materialized=(True,) * len(aval.shape),
+        replication_factor=1)
+
+
+def execute_replicated(compiled,
+                       uses_outfeed, backend, in_handler, out_handler, *args):
+  xla.check_before_outfeed_execution(uses_outfeed)
   input_bufs = in_handler(args)
-  out_bufs = compiled.ExecuteOnLocalDevices(list(input_bufs))
+  out_bufs = compiled.execute_on_local_devices(list(input_bufs))
   return out_handler(out_bufs)
 
 
 xla_pmap_p = core.Primitive('xla_pmap')
-xla_pmap_p.call_primitive = True
+xla_pmap_p.map_primitive = True
 xla_pmap_p.multiple_results = True
 xla_pmap = partial(core.map_bind, xla_pmap_p)
 xla_pmap_p.def_custom_bind(xla_pmap)
@@ -843,7 +1057,7 @@ def _pmap_translation_rule(c, axis_env,
   out_avals = [v.aval for v in call_jaxpr.outvars]
   outs = [_xla_unshard(c, aval, new_env, shard, backend=backend)
           for aval, shard in zip(out_avals, sharded_outs)]
-  return c.Tuple(*outs)
+  return xops.Tuple(c, outs)
 
 xla.call_translations[xla_pmap_p] = _pmap_translation_rule
 ad.primitive_transposes[xla_pmap_p] = partial(ad.map_transpose, xla_pmap_p)
@@ -852,12 +1066,12 @@ def _xla_shard(c, aval, axis_env, x):
   if aval is core.abstract_unit:
     return x
   elif isinstance(aval, ShapedArray):
-    dims = list(c.GetShape(x).dimensions())
-    zero = c.Constant(onp.zeros((), dtype=onp.uint32))
+    dims = list(c.get_shape(x).dimensions())
+    zero = xb.constant(c, onp.zeros((), dtype=onp.uint32))
     idxs = [_unravel_index(c, axis_env)] + [zero] * (len(dims) - 1)
-    return c.Reshape(c.DynamicSlice(x, idxs, [1] + dims[1:]), None, dims[1:])
+    return xops.Reshape(xops.DynamicSlice(x, idxs, [1] + dims[1:]), dims[1:])
   else:
-    raise TypeError((aval, c.GetShape(x)))
+    raise TypeError((aval, c.get_shape(x)))
 
 # TODO(b/110096942): more efficient gather
 def _xla_unshard(c, aval, axis_env, x, backend):
@@ -868,29 +1082,31 @@ def _xla_unshard(c, aval, axis_env, x, backend):
     convert_bool = (onp.issubdtype(aval.dtype, onp.bool_)
                     and xb.get_backend(backend).platform in ('cpu', 'gpu'))
     if convert_bool:
-      x = c.ConvertElementType(x, xb.dtype_to_etype(onp.float32))
+      x = xops.ConvertElementType(x, xb.dtype_to_etype(onp.float32))
 
-    xla_shape = c.GetShape(x)
+    xla_shape = c.get_shape(x)
     dims = list(xla_shape.dimensions())
-    padded = c.Broadcast(c.Constant(onp.array(0, xla_shape.numpy_dtype())),
+    padded = xops.Broadcast(xb.constant(c, onp.array(0, xla_shape.numpy_dtype())),
                          [axis_env.sizes[-1]] + dims)
-    zero = c.Constant(onp.zeros((), dtype=onp.uint32))
+    zero = xb.constant(c, onp.zeros((), dtype=onp.uint32))
     idxs = [_unravel_index(c, axis_env)] + [zero] * len(dims)
-    padded = c.DynamicUpdateSlice(padded, c.Reshape(x, None, [1] + dims), idxs)
-    out = c.CrossReplicaSum(padded, xla.axis_groups(axis_env, axis_env.names[-1]))
+    padded = xops.DynamicUpdateSlice(padded, xops.Reshape(x, [1] + dims), idxs)
+    replica_groups_protos = xc.make_replica_groups(
+      xla.axis_groups(axis_env, axis_env.names[-1]))
+    out = xops.CrossReplicaSum(padded, replica_groups_protos)
 
     # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
     if convert_bool:
-      nonzero = c.Ne(out, c.Constant(onp.array(0, dtype=onp.float32)))
-      out = c.ConvertElementType(nonzero, xb.dtype_to_etype(onp.bool_))
+      nonzero = xops.Ne(out, xb.constant(c, onp.array(0, dtype=onp.float32)))
+      out = xops.ConvertElementType(nonzero, xb.dtype_to_etype(onp.bool_))
     return out
   else:
-    raise TypeError((aval, c.GetShape(x)))
+    raise TypeError((aval, c.get_shape(x)))
 
 def _unravel_index(c, axis_env):
-  div = c.Constant(onp.array(axis_env.nreps // prod(axis_env.sizes), onp.uint32))
-  mod = c.Constant(onp.array(axis_env.sizes[-1], onp.uint32))
-  return c.Rem(c.Div(c.ReplicaId(), div), mod)
+  div = xb.constant(c, onp.array(axis_env.nreps // prod(axis_env.sizes), onp.uint32))
+  mod = xb.constant(c, onp.array(axis_env.sizes[-1], onp.uint32))
+  return xops.Rem(xops.Div(xops.ReplicaId(c), div), mod)
 
 
 ### soft_pmap axis split transformation

@@ -107,18 +107,18 @@ class custom_jvp:
 
   For example::
 
-    import jax.numpy as np
+    import jax.numpy as jnp
 
     @jax.custom_jvp
     def f(x, y):
-      return np.sin(x) * y
+      return jnp.sin(x) * y
 
     @f.defjvp
     def f_jvp(primals, tangents):
       x, y = primals
       x_dot, y_dot = tangents
       primal_out = f(x, y)
-      tangent_out = np.cos(x) * x_dot * y - np.sin(x) * y_dot
+      tangent_out = jnp.cos(x) * x_dot * y + jnp.sin(x) * y_dot
       return primal_out, tangent_out
 
   For a more detailed introduction, see the tutorial_.
@@ -150,18 +150,18 @@ class custom_jvp:
 
     Example::
 
-      import jax.numpy as np
+      import jax.numpy as jnp
 
       @jax.custom_jvp
       def f(x, y):
-        return np.sin(x) * y
+        return jnp.sin(x) * y
 
       @f.defjvp
       def f_jvp(primals, tangents):
         x, y = primals
         x_dot, y_dot = tangents
         primal_out = f(x, y)
-        tangent_out = np.cos(x) * x_dot * y - np.sin(x) * y_dot
+        tangent_out = jnp.cos(x) * x_dot * y + jnp.sin(x) * y_dot
         return primal_out, tangent_out
     """
     self.jvp = jvp
@@ -184,10 +184,10 @@ class custom_jvp:
 
       @jax.custom_jvp
       def f(x, y):
-        return np.sin(x) * y
+        return jnp.sin(x) * y
 
-      f.defjvps(lambda x_dot, primal_out, x, y: np.cos(x) * x_dot * y,
-                lambda y_dot, primal_out, x, y: -np.sin(x) * y_dot)
+      f.defjvps(lambda x_dot, primal_out, x, y: jnp.cos(x) * x_dot * y,
+                lambda y_dot, primal_out, x, y: jnp.sin(x) * y_dot)
     """
     if self.nondiff_argnums:
       raise TypeError("Can't use ``defjvps`` with ``nondiff_argnums``.")
@@ -343,13 +343,11 @@ xla.initial_style_translations[custom_jvp_call_jaxpr_p] = \
     xla.lower_fun_initial_style(_custom_jvp_call_jaxpr_impl)
 
 # If a (multi)linear function is defined with a custom jvp, then
-# custom_jvp_call_jaxpr can appear in jaxprs to be transposed. We transpose it
-# like a core.call.
+# custom_jvp_call_jaxpr can appear in jaxprs to be transposed. Since it's
+# already been linearized, we can drop the jvp rule.
 def _custom_jvp_call_jaxpr_transpose(cts, *args, fun_jaxpr, jvp_jaxpr_thunk):
   del jvp_jaxpr_thunk
-  name = 'custom_jvp_call_jaxpr_linear'
-  return ad.call_transpose(core.call_p, dict(name=name), fun_jaxpr.jaxpr,
-                           tuple(fun_jaxpr.literals) + args, cts)
+  return ad.backward_pass(fun_jaxpr.jaxpr, fun_jaxpr.literals, args, cts)
 ad.primitive_transposes[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_transpose
 
 
@@ -370,18 +368,18 @@ class custom_vjp:
 
   For example::
 
-    import jax.numpy as np
+    import jax.numpy as jnp
 
     @jax.custom_vjp
     def f(x, y):
-      return np.sin(x) * y
+      return jnp.sin(x) * y
 
     def f_fwd(x, y):
-      return f(x, y), (np.cos(x), np.sin(x), y)
+      return f(x, y), (jnp.cos(x), jnp.sin(x), y)
 
     def f_bwd(res, g):
       cos_x, sin_x, y = res
-      return (cos_x * g * y, -sin_x * g)
+      return (cos_x * g * y, sin_x * g)
 
     f.defvjp(f_fwd, f_bwd)
 
@@ -424,18 +422,18 @@ class custom_vjp:
 
     Example::
 
-      import jax.numpy as np
+      import jax.numpy as jnp
 
       @jax.custom_vjp
       def f(x, y):
-        return np.sin(x) * y
+        return jnp.sin(x) * y
 
       def f_fwd(x, y):
-        return f(x, y), (np.cos(x), np.sin(x), y)
+        return f(x, y), (jnp.cos(x), jnp.sin(x), y)
 
       def f_bwd(res, g):
         cos_x, sin_x, y = res
-        return (cos_x * g * y, -sin_x * g)
+        return (cos_x * g * y, sin_x * g)
 
       f.defvjp(f_fwd, f_bwd)
     """
